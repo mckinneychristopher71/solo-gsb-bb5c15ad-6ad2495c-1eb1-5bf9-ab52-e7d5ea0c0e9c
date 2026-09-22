@@ -20,6 +20,7 @@ from . import database as dbmod
 from .aligner import align, manual_record, split_paragraphs
 from .citations import REF_TYPE_LABEL, scan_citations
 from .database import db, citation_row_to_dict, indices_to_str, row_to_dict
+from .migration import MIGRATION_STATUS_LABEL, analyze_migration
 from .schemas import (
     AlignmentCreate,
     AlignmentPatch,
@@ -493,6 +494,137 @@ def export_citations(
         ])
     data = b"\xef\xbb\xbf" + buf.getvalue().encode("utf-8")
     fname = f"regreview-citations-{doc_id}-{stamp}.csv"
+    return Response(content=data, media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f"attachment; filename={fname}"})
+
+
+# ---------------- 引用迁移核验 ----------------
+
+def _migration_result(conn, doc_id: int) -> dict:
+    """即时计算引用迁移核验（引用重扫或映射调整后再次调用即自动重算）。"""
+    old, new = _load_paragraphs(conn, doc_id)
+    aligns = [row_to_dict(r) for r in conn.execute(
+        "SELECT * FROM alignments WHERE document_id=? ORDER BY id", (doc_id,)
+    ).fetchall()]
+    return analyze_migration(old, new, aligns)
+
+
+def _filter_migration_items(items: list[dict], status: str | None,
+                            ref_type: str | None, keyword: str | None) -> list[dict]:
+    kw = keyword.strip().lower() if keyword else ""
+    out = []
+    for it in items:
+        if status and it["status"] != status:
+            continue
+        if ref_type and it["ref_type"] != ref_type:
+            continue
+        if kw:
+            blob = it["mapping_basis"] + it["reason"] + it["ref_type"]
+            for side in (it["old"], it["new"]):
+                if side:
+                    blob += side["mention_text"] + side["target_label"] + side["reason"]
+            for e in it["expected_targets"]:
+                blob += e["label"] + e["excerpt"]
+            if kw not in blob.lower():
+                continue
+        out.append(it)
+    return out
+
+
+@app.get("/api/documents/{doc_id}/citation-migrations")
+def list_citation_migrations(
+    doc_id: int,
+    status: str | None = Query(None, pattern="^(migrated|suspected|review)$"),
+    ref_type: str | None = None,
+    keyword: str | None = None,
+):
+    """引用迁移核验列表（对旧版/新版分别执行现有引用解析后即时比对）。
+
+    仅审查有新旧段落映射的来源组；组内按引用类型与出现序号配对。
+    三态：已迁移 / 疑似错指 / 待核验，可筛选；结果随映射与引用扫描即时重算。
+    """
+    with db() as conn:
+        doc = _get_doc_or_404(conn, doc_id)
+        result = _migration_result(conn, doc_id)
+        old_paras = [r[0] for r in conn.execute(
+            "SELECT content FROM paragraphs WHERE document_id=? AND side='old' ORDER BY idx",
+            (doc_id,)).fetchall()]
+        new_paras = [r[0] for r in conn.execute(
+            "SELECT content FROM paragraphs WHERE document_id=? AND side='new' ORDER BY idx",
+            (doc_id,)).fetchall()]
+    items = _filter_migration_items(result["items"], status, ref_type, keyword)
+    return {
+        "document_id": doc_id,
+        "title": doc["title"],
+        "counts": result["counts"],
+        "total": result["total"],
+        "groups_reviewed": result["groups_reviewed"],
+        "status_labels": MIGRATION_STATUS_LABEL,
+        "ref_type_labels": REF_TYPE_LABEL,
+        "old_paragraphs": old_paras,
+        "new_paragraphs": new_paras,
+        "items": items,
+    }
+
+
+@app.get("/api/documents/{doc_id}/citation-migrations-export")
+def export_citation_migrations(
+    doc_id: int,
+    status: str | None = Query(None, pattern="^(migrated|suspected|review)$"),
+    ref_type: str | None = None,
+    keyword: str | None = None,
+):
+    """导出引用迁移核验 CSV（UTF-8 BOM，Excel 可直接打开）。
+
+    每行含旧引用、预期目标、新版实际目标与映射依据；默认全量导出，
+    可按三态 / 引用类型 / 关键字筛选。
+    """
+    with db() as conn:
+        _get_doc_or_404(conn, doc_id)
+        result = _migration_result(conn, doc_id)
+    rows = _filter_migration_items(result["items"], status, ref_type, keyword)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow([
+        "序号", "核验状态", "映射组", "引用类型", "组内出现序号",
+        "旧引用原文", "旧引用位置", "旧引用解析状态", "旧引用目标",
+        "预期新版目标", "新版引用原文", "新版引用位置", "新版解析状态",
+        "新版实际目标", "判定说明", "映射依据",
+    ])
+
+    def side_desc(side: dict | None) -> tuple[str, str, str, str]:
+        if side is None:
+            return ("", "", "（无配对）", "")
+        status_text = CITATION_STATUS[side["status"]]
+        if side["status"] == "ok":
+            tgt = side["target_label"]
+        elif side["status"] == "ambiguous":
+            tgt = "歧义候选：" + "；".join(c["label"] for c in side["candidates"])
+        else:
+            tgt = "缺失：" + side["reason"]
+        return (side["mention_text"], side["source_location"], status_text, tgt)
+
+    for i, it in enumerate(rows, 1):
+        o, n = it["old"], it["new"]
+        om, oloc, ostat, otgt = side_desc(o)
+        nm, nloc, nstat, ntgt = side_desc(n)
+        expected = "\n".join(f"{e['label']}（经映射 #{e['via_alignment_id']}）\n{e['excerpt']}"
+                             for e in it["expected_targets"])
+        writer.writerow([
+            i,
+            MIGRATION_STATUS_LABEL[it["status"]],
+            f"对齐记录 #{it['alignment_id']}",
+            REF_TYPE_LABEL.get(it["ref_type"], it["ref_type"]),
+            it["pair_ordinal"] if it["pair_ordinal"] is not None else "",
+            om, oloc, ostat, otgt,
+            expected,
+            nm, nloc, nstat, ntgt,
+            it["reason"],
+            it["mapping_basis"],
+        ])
+    data = b"\xef\xbb\xbf" + buf.getvalue().encode("utf-8")
+    fname = f"regreview-citation-migrations-{doc_id}-{stamp}.csv"
     return Response(content=data, media_type="text/csv; charset=utf-8",
                     headers={"Content-Disposition": f"attachment; filename={fname}"})
 

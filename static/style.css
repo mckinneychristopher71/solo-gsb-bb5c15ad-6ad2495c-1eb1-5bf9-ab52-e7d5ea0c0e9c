@@ -377,3 +377,39 @@ textarea { resize: vertical; min-height: 260px; font-family: ui-monospace, "SFMo
 .text-box.tgt-amb { background: var(--warn-soft); border-color: #fde68a; }
 .text-box.tgt-amb h4 { color: var(--warn); }
 
+/* ---------- 引用迁移 ---------- */
+.chip.mig-chip.all { background: var(--unchanged-soft); color: var(--unchanged); }
+.chip.mig-chip.migrated { background: var(--new-soft); color: var(--new); }
+.chip.mig-chip.suspected { background: var(--warn-soft); color: var(--warn); }
+.chip.mig-chip.review { background: var(--old-soft); color: var(--old); }
+
+.mig-card.migrated { border-left-color: var(--new); }
+.mig-card.suspected { border-left-color: var(--warn); }
+.mig-card.review { border-left-color: var(--old); }
+
+.cite-badge.mig-badge.migrated { background: var(--new-soft); color: var(--new); }
+.cite-badge.mig-badge.suspected { background: var(--warn-soft); color: var(--warn); }
+.cite-badge.mig-badge.review { background: var(--old-soft); color: var(--old); }
+
+.mig-grid {
+  display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px;
+  align-items: start;
+}
+.mig-col-title { margin: 0 0 6px; font-size: 13px; }
+.mig-col-title.old-t { color: var(--old); }
+.mig-col-title.new-t { color: var(--new); }
+.mig-side { padding: 10px 12px; }
+.mig-side h4 {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  font-size: 13px; margin-bottom: 6px;
+}
+.mig-side .cite-quote { padding: 8px 10px; font-size: 12.5px; }
+.mig-side .target-text { font-size: 12.5px; }
+.mig-expected { background: var(--accent-soft); border-color: #c7d2fe; }
+.mig-expected h4 { color: var(--accent); font-size: 12px; }
+.mig-basis { margin-bottom: 0; margin-top: 12px; }
+
+@media (max-width: 1100px) {
+  .mig-grid { grid-template-columns: 1fr; }
+}
+
