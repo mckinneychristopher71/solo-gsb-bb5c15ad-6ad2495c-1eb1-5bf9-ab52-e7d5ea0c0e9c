@@ -20,6 +20,11 @@ from . import database as dbmod
 from .aligner import align, manual_record, split_paragraphs
 from .citations import REF_TYPE_LABEL, scan_citations
 from .database import db, citation_row_to_dict, indices_to_str, row_to_dict
+from .migration import (
+    MIGRATION_STATUS_LABEL,
+    build_migration,
+    filter_items as filter_migration_items,
+)
 from .schemas import (
     AlignmentCreate,
     AlignmentPatch,
@@ -493,6 +498,104 @@ def export_citations(
         ])
     data = b"\xef\xbb\xbf" + buf.getvalue().encode("utf-8")
     fname = f"regreview-citations-{doc_id}-{stamp}.csv"
+    return Response(content=data, media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f"attachment; filename={fname}"})
+
+
+# ---------------- 引用迁移复核 ----------------
+
+def _compute_migration(conn, doc_id: int) -> dict:
+    """即时计算引用迁移结果（不落库）：重扫引用或调整映射后自动为最新。"""
+    old, new = _load_paragraphs(conn, doc_id)
+    aligns = [row_to_dict(r) for r in conn.execute(
+        "SELECT * FROM alignments WHERE document_id=? ORDER BY id", (doc_id,)).fetchall()]
+    result = build_migration(old, new, aligns, change_type_labels=CHANGE_TYPES)
+    result["old_paragraphs"] = old
+    result["new_paragraphs"] = new
+    return result
+
+
+@app.get("/api/documents/{doc_id}/migration")
+def list_migration(
+    doc_id: int,
+    status: str | None = Query(None, pattern="^(migrated|suspected|review)$"),
+    ref_type: str | None = None,
+    keyword: str | None = None,
+):
+    """引用迁移复核：对旧版与新版分别执行引用解析，按来源映射组配对追踪。
+
+    仅审查有新旧段落映射的来源；组内按引用类型与出现序号配对，
+    返回三态 ``migrated``（已迁移）/ ``suspected``（疑似错指）/
+    ``review``（待核验，含同类型数量不等产生的未配对项）。
+    结果每次请求即时重算，引用重扫或手动调整映射后无需额外刷新。
+    """
+    with db() as conn:
+        _get_doc_or_404(conn, doc_id)
+        result = _compute_migration(conn, doc_id)
+    result["items"] = filter_migration_items(result["items"], status, ref_type, keyword)
+    result["status_labels"] = MIGRATION_STATUS_LABEL
+    result["ref_type_labels"] = REF_TYPE_LABEL
+    result["filters"] = {"status": status, "ref_type": ref_type, "keyword": keyword}
+    return result
+
+
+@app.get("/api/documents/{doc_id}/migration-export")
+def export_migration(
+    doc_id: int,
+    status: str | None = Query(None, pattern="^(migrated|suspected|review)$"),
+    ref_type: str | None = None,
+    keyword: str | None = None,
+):
+    """导出引用迁移复核 CSV（UTF-8 BOM，Excel 可直接打开）。
+
+    默认导出全部配对结果；传 ``status`` / ``ref_type`` / ``keyword``
+    时与页面筛选条件一致。每行含旧引用、预期目标、新版实际目标与映射依据。
+    """
+    with db() as conn:
+        _get_doc_or_404(conn, doc_id)
+        result = _compute_migration(conn, doc_id)
+    rows = filter_migration_items(result["items"], status, ref_type, keyword)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow([
+        "序号", "迁移状态", "来源映射依据", "引用类型", "组内出现序号",
+        "旧版来源位置", "旧引用原文", "旧引用解析状态", "旧引用目标",
+        "预期新版目标（段落）", "预期目标原文", "目标映射依据",
+        "新版来源位置", "新版引用原文", "新版引用解析状态", "新版实际目标",
+        "新版实际目标原文", "判定说明",
+    ])
+
+    def _m(m, key, default=""):
+        return default if m is None else m.get(key, default)
+
+    for i, it in enumerate(rows, 1):
+        om, nm = it["old_mention"], it["new_mention"]
+        writer.writerow([
+            i,
+            MIGRATION_STATUS_LABEL[it["status"]],
+            it["group_basis"],
+            it["ref_type_label"],
+            it["occurrence"],
+            _m(om, "source_location"),
+            _m(om, "mention_text"),
+            CITATION_STATUS[_m(om, "status")] if om and _m(om, "status") in CITATION_STATUS else
+                ("（未配对，缺失）" if om is None else ""),
+            _m(om, "target_label"),
+            "；".join(f"{t['label']}（第 {t['para_idx'] + 1} 段）"
+                      for t in it["expected_targets"]),
+            "\n---\n".join(t["excerpt"] for t in it["expected_targets"]),
+            "；".join(it["target_basis"]),
+            _m(nm, "source_location"),
+            _m(nm, "mention_text"),
+            CITATION_STATUS[_m(nm, "status")] if nm and _m(nm, "status") in CITATION_STATUS else
+                ("（未配对，缺失）" if nm is None else ""),
+            _m(nm, "target_label"),
+            _m(nm, "target_excerpt"),
+            it["reason"],
+        ])
+    data = b"\xef\xbb\xbf" + buf.getvalue().encode("utf-8")
+    fname = f"regreview-migration-{doc_id}-{stamp}.csv"
     return Response(content=data, media_type="text/csv; charset=utf-8",
                     headers={"Content-Disposition": f"attachment; filename={fname}"})
 

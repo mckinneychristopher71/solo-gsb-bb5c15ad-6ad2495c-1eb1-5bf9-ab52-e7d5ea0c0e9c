@@ -510,6 +510,8 @@ class TargetUnit:
     excerpt: str
     kuan_no: int | None = None
     xiang_no: int | None = None
+    # 目标覆盖的全部段落（条目标含条标题＋续段多段；款/项目标为单段）
+    para_indices: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -545,7 +547,8 @@ def _article_unit(struct: Structure, art: int, para: int) -> TargetUnit:
     # 目标原文聚合该条归属的全部段落（条标题＋续段/显式款段）
     paras = struct.art_paras.get(art, []) or [para]
     excerpt = "\n\n".join(struct.paragraphs[p] for p in paras)
-    return TargetUnit(para_idx=para, label=_art_label(art), excerpt=excerpt)
+    return TargetUnit(para_idx=para, label=_art_label(art), excerpt=excerpt,
+                      para_indices=list(paras))
 
 
 def _resolve_article(struct: Structure, art: int | None, raw_label: str,
@@ -563,7 +566,7 @@ def _resolve_article(struct: Structure, art: int | None, raw_label: str,
     if len(heads) > 1:
         cands = [TargetUnit(para_idx=p,
                             label=f"{_art_label(art)}（新版第 {p + 1} 段，编号重复）",
-                            excerpt=struct.paragraphs[p]) for p in heads]
+                            excerpt=struct.paragraphs[p], para_indices=[p]) for p in heads]
         return ("ambiguous", [], cands,
                 f"新版中存在 {len(heads)} 处{_art_label(art)}标题（段落 "
                 f"{'、'.join(str(p + 1) for p in heads)}），无法确定唯一目标")
@@ -581,12 +584,14 @@ def _find_kuan(struct: Structure, art: int, k: int) -> KuanUnit | None:
 def _kuan_target(ku: KuanUnit, struct: Structure) -> TargetUnit:
     return TargetUnit(para_idx=ku.para,
                       label=_kuan_label(ku.art_no, ku.kuan_no),
-                      excerpt=ku.text, kuan_no=ku.kuan_no)
+                      excerpt=ku.text, kuan_no=ku.kuan_no,
+                      para_indices=[ku.para])
 
 
 def _xiang_target(xu: XiangUnit) -> TargetUnit:
     return TargetUnit(para_idx=xu.para, label=_xiang_label(xu.art_no, xu.kuan_no, xu.xiang_no),
-                      excerpt=xu.text, kuan_no=xu.kuan_no, xiang_no=xu.xiang_no)
+                      excerpt=xu.text, kuan_no=xu.kuan_no, xiang_no=xu.xiang_no,
+                      para_indices=[xu.para])
 
 
 def _resolve_xiang_in_kuan(ku: KuanUnit, x: int) -> tuple[str, list, str]:
@@ -745,8 +750,13 @@ def resolve(men: Mention, struct: Structure) -> Result:
 
 # ---------------- 扫描入口 ----------------
 
-def scan_citations(paragraphs: list[str]) -> list[dict]:
-    """扫描新版段落，返回引用检查记录（dict，可直接落库）。"""
+def scan_citations(paragraphs: list[str], side: str = "new") -> list[dict]:
+    """扫描条款引用，返回引用检查记录（dict，可直接落库）。
+
+    ``side`` 为 ``old`` / ``new``，仅影响“来源位置”等展示文案；旧版/新版
+    使用完全相同的解析流程。
+    """
+    side_name = "新版" if side == "new" else "旧版"
     struct = build_structure(paragraphs)
     mentions = extract_mentions(paragraphs)
     records: list[dict] = []
@@ -756,7 +766,7 @@ def scan_citations(paragraphs: list[str]) -> list[dict]:
         src_art = src.art_no if src else None
         src_kuan = src.kuan_no if src else None
         src_xiang = src.xiang_no if src else None
-        loc_parts = [f"新版第 {men.para + 1} 段"]
+        loc_parts = [f"{side_name}第 {men.para + 1} 段"]
         if src_art is not None:
             loc_parts.append(_art_label(src_art))
             if src_kuan is not None:
@@ -779,9 +789,13 @@ def scan_citations(paragraphs: list[str]) -> list[dict]:
             "status": res.status,
             "targets": [{"para_idx": t.para_idx, "label": t.label,
                          "excerpt": t.excerpt, "kuan_no": t.kuan_no,
-                         "xiang_no": t.xiang_no} for t in res.targets],
+                         "xiang_no": t.xiang_no,
+                         "para_indices": list(t.para_indices or [t.para_idx])}
+                        for t in res.targets],
             "candidates": [{"para_idx": c.para_idx, "label": c.label,
-                            "excerpt": c.excerpt} for c in res.candidates],
+                            "excerpt": c.excerpt,
+                            "para_indices": list(c.para_indices or [c.para_idx])}
+                           for c in res.candidates],
             "target_label": res.target_label,
             "target_excerpt": res.target_excerpt,
             "source_location": " · ".join(loc_parts),

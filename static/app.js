@@ -9,15 +9,20 @@ const DECISION_LABEL = {
   pending: "待审阅", confirmed: "确认", disputed: "有异议", ignored: "忽略",
 };
 const CITE_STATUS_LABEL = { ok: "正常", missing: "缺失", ambiguous: "歧义" };
+const MIG_STATUS_LABEL = { migrated: "已迁移", suspected: "疑似错指", review: "待核验" };
 
 const state = {
   view: "list",           // list | upload | workspace
-  tab: "align",           // align | citations
+  tab: "align",           // align | citations | migration
   doc: null,              // 当前文档详情
   cit: null,              // 引用检查数据 {check, items, new_paragraphs, ref_type_labels}
   citStatus: "",          // 引用检查状态筛选 ok|missing|ambiguous
   citType: "",            // 引用类型筛选
   citKw: "",              // 引用关键字
+  mig: null,              // 引用迁移数据 {items, counts, old/new_paragraphs, ref_type_labels}
+  migStatus: "",          // 迁移三态筛选 migrated|suspected|review
+  migType: "",            // 迁移引用类型筛选
+  migKw: "",              // 迁移关键字
   filterType: "",         // 变更类型筛选
   filterDecision: "",     // 决定筛选
   search: "",
@@ -176,6 +181,10 @@ async function openDoc(id) {
   state.citStatus = "";
   state.citType = "";
   state.citKw = "";
+  state.mig = null;
+  state.migStatus = "";
+  state.migType = "";
+  state.migKw = "";
   state.filterType = "";
   state.filterDecision = "";
   state.search = "";
@@ -197,9 +206,18 @@ async function loadCitations() {
   } catch (e) { toast(e.message, true); state.cit = null; }
 }
 
+async function loadMigration() {
+  try {
+    state.mig = await api(`/api/documents/${state.doc.id}/migration`);
+  } catch (e) { toast(e.message, true); state.mig = null; }
+}
+
 async function switchTab(tab) {
   state.tab = tab;
   if (tab === "citations" && !state.cit) await loadCitations();
+  // 迁移结果由后端即时重算：每次进入标签页都拉取最新结果，
+  // 引用重扫或手动调整映射后自动反映，无需手动刷新。
+  if (tab === "migration") await loadMigration();
   renderWorkspace();
 }
 
@@ -223,7 +241,11 @@ function renderWorkspace() {
       cc
         ? h("span", { class: `tab-count ${nIssues ? "warn" : "ok"}` },
             nIssues ? `问题 ${nIssues}` : `${cc.total} 项无误`)
-        : h("span", { class: "tab-count" }, "未扫描")));
+        : h("span", { class: "tab-count" }, "未扫描")),
+    h("button", {
+      class: `tab ${state.tab === "migration" ? "active" : ""}`,
+      onclick: () => switchTab("migration"),
+    }, "引用迁移", migTabCount()));;
 
   const head = h("div", { class: "panel" },
     h("div", { class: "breadcrumb", onclick: renderList }, "← 返回文档列表"),
@@ -244,7 +266,17 @@ function renderWorkspace() {
 
   $app.append(head);
   if (state.tab === "align") renderAlignTab();
-  else renderCitationsTab();
+  else if (state.tab === "citations") renderCitationsTab();
+  else renderMigrationTab();
+}
+
+function migTabCount() {
+  const m = state.mig;
+  if (!m) return h("span", { class: "tab-count" }, "待计算");
+  const c = m.counts;
+  const nRisk = (c.suspected || 0) + (c.review || 0);
+  return h("span", { class: `tab-count ${nRisk ? "warn" : "ok"}` },
+    nRisk ? `待处理 ${nRisk}` : `${c.migrated || 0} 项已迁移`);
 }
 
 // ---------------- 对齐 Tab ----------------
@@ -335,6 +367,8 @@ async function rescanCitations() {
       n_missing: stats.n_missing, n_ambiguous: stats.n_ambiguous,
     };
     state.cit = null;
+    // 引用重扫后迁移复核结果即时重算：清缓存，再次进入标签页即取最新
+    state.mig = null;
     await loadCitations();
     renderWorkspace();
     toast(`扫描完成：共 ${stats.total} 项，缺失 ${stats.n_missing}，歧义 ${stats.n_ambiguous}`);
@@ -537,6 +571,171 @@ async function openCitationModal(issueId) {
       h("div", { class: "modal-foot" },
         h("button", { class: "btn primary", onclick: close }, "关闭"))));
   root.append(modal);
+}
+
+// ---------------- 引用迁移 Tab ----------------
+
+function filteredMigrationItems() {
+  const items = state.mig ? state.mig.items : [];
+  const kw = state.migKw.trim().toLowerCase();
+  return items.filter(it => {
+    if (state.migStatus && it.status !== state.migStatus) return false;
+    if (state.migType && it.ref_type !== state.migType) return false;
+    if (kw) {
+      const parts = [it.reason, it.group_basis, it.ref_type_label,
+        ...(it.target_basis || []),
+        ...(it.expected_targets || []).map(t => t.label)];
+      for (const side of [it.old_mention, it.new_mention]) {
+        if (side) parts.push(side.mention_text, side.target_label, side.source_location, side.reason);
+      }
+      if (!parts.join(" ").toLowerCase().includes(kw)) return false;
+    }
+    return true;
+  });
+}
+
+async function recomputeMigration() {
+  // 后端即时重算（旧/新版重新解析 + 按当前映射推导）
+  await loadMigration();
+  renderWorkspace();
+  const c = state.mig ? state.mig.counts : null;
+  toast(c ? `已重算：已迁移 ${c.migrated} · 疑似错指 ${c.suspected} · 待核验 ${c.review}` : "重算完成");
+}
+
+function renderMigrationTab() {
+  if (!state.mig) {
+    $app.append(h("div", { class: "panel" },
+      h("div", { class: "empty" }, "引用迁移数据计算中……")));
+    return;
+  }
+  const mig = state.mig;
+  const c = mig.counts;
+
+  const chips = [
+    { key: "", label: `全部 ${mig.items.length}` },
+    { key: "migrated", label: `已迁移 ${c.migrated || 0}` },
+    { key: "suspected", label: `疑似错指 ${c.suspected || 0}` },
+    { key: "review", label: `待核验 ${c.review || 0}` },
+  ].map(z => h("span", {
+    class: `chip clickable mig-chip ${z.key || "all"} ${state.migStatus === z.key ? "" : "off"}`,
+    onclick: () => { state.migStatus = z.key; renderWorkspace(); },
+  }, h("span", { class: "dot" }), z.label));
+
+  const typeSet = [...new Set(mig.items.map(x => x.ref_type))];
+
+  const panel = h("div", { class: "panel tab-panel" },
+    h("div", { class: "cit-headline" },
+      h("div", {},
+        h("b", {}, "引用迁移复核"),
+        h("div", { class: "hint" },
+          `对旧版（${mig.n_old_mentions} 处引用）与新版（${mig.n_new_mentions} 处引用）分别执行引用解析，`
+          + `仅审查 ${mig.n_groups} 个有新旧段落映射的来源组；组内按引用类型与出现序号配对，禁止猜测。`)),
+      h("div", { class: "actions", style: "margin:0" },
+        h("button", { class: "btn sm", onclick: recomputeMigration }, "↻ 即时重算"),
+        h("button", { class: "btn primary sm", onclick: exportMigration }, "⬇ 导出 CSV"))),
+    h("div", { class: "stats" }, chips),
+    h("div", { class: "toolbar" },
+      h("input", {
+        type: "text", placeholder: "搜索旧/新引用、目标、映射依据、原因…", value: state.migKw,
+        oninput: (e) => { state.migKw = e.target.value; applyMigrationFilter(); },
+      }),
+      h("select", {
+        onchange: (e) => { state.migType = e.target.value; renderWorkspace(); },
+      },
+        h("option", { value: "" }, "全部引用类型"),
+        ...typeSet.map(t => h("option", {
+          value: t, selected: state.migType === t,
+        }, (mig.ref_type_labels && mig.ref_type_labels[t]) || t))),
+      h("span", { class: "foot-label", id: "mig-visible-count" })));
+
+  const list = h("div", { id: "migration-list" });
+  const rows = filteredMigrationItems();
+  rows.forEach(it => list.appendChild(renderMigrationCard(it)));
+  if (!rows.length) {
+    list.append(h("div", { class: "empty" }, "当前筛选条件下没有迁移记录"));
+  }
+  $app.append(panel, list);
+  applyMigrationFilter();
+}
+
+function exportMigration() {
+  const p = new URLSearchParams();
+  if (state.migStatus) p.set("status", state.migStatus);
+  if (state.migType) p.set("ref_type", state.migType);
+  if (state.migKw.trim()) p.set("keyword", state.migKw.trim());
+  const qs = p.toString();
+  window.location.href = `/api/documents/${state.doc.id}/migration-export${qs ? "?" + qs : ""}`;
+}
+
+function applyMigrationFilter() {
+  const n = filteredMigrationItems().length;
+  const total = state.mig ? state.mig.items.length : 0;
+  const el = document.getElementById("mig-visible-count");
+  if (el) el.textContent = `显示 ${n} / ${total} 项` +
+    (state.migStatus || state.migType || state.migKw.trim() ? "（已筛选）" : "");
+}
+
+function migSourceBox(side, m) {
+  if (!m) {
+    return h("div", { class: "text-box empty-box mig-box" },
+      h("h4", {}, side === "old" ? "旧版引用 · 无配对项" : "新版引用 · 无配对项"),
+      "（同类型引用数量不等，标记为待核验）");
+  }
+  const paras = state.mig[side === "old" ? "old_paragraphs" : "new_paragraphs"];
+  const srcText = paras[m.source_para_idx] || "";
+  const cls = side === "old" ? "old" : "new";
+  return h("div", { class: `text-box ${cls} mig-box` },
+    h("h4", {}, `${side === "old" ? "旧引用" : "新引用"} · ${m.source_location}　`,
+      h("span", { class: `cite-badge ${m.status}` }, CITE_STATUS_LABEL[m.status])),
+    h("div", { class: "cite-quote" }, highlightMention(srcText, m.source_start, m.source_end)),
+    m.status === "ok"
+      ? h("div", { class: "mig-actual" },
+          h("b", {}, "解析目标："), h("span", { class: "cite-target-label" }, m.target_label),
+          ...m.targets.map(t => h("div", { class: "target-unit" },
+            h("div", { class: "target-tag" },
+              `${t.label} · ${side === "old" ? "旧版" : "新版"}第 ${t.para_idx + 1} 段`),
+            h("div", { class: "target-text" }, t.excerpt))))
+      : h("div", { class: `cite-target ${m.status}` },
+          h("b", {}, m.status === "missing" ? "目标　" : "候选　"),
+          h("span", { class: "cite-why" },
+            (m.status === "missing" ? "缺失：" : `歧义：${m.candidates.length} 个候选，不自动选取。`)
+            + m.reason)));
+}
+
+function renderMigrationCard(it) {
+  const expectedBlock = h("div", { class: "mig-expected" },
+    h("b", {}, "预期目标（旧目标所在对齐记录的全部新版段落）　"),
+    it.expected_targets.length
+      ? h("div", { class: "mig-exp-list" }, ...it.expected_targets.map(t =>
+          h("div", { class: "target-unit" },
+            h("div", { class: "target-tag" }, `${t.label} · 新版第 ${t.para_idx + 1} 段`),
+            h("div", { class: "target-text" }, t.excerpt))))
+      : h("span", { class: "foot-label" }, "（无可用预期集合）"));
+
+  const basisBlock = h("div", { class: "mig-basis" },
+    h("b", {}, "映射依据："),
+    h("div", { class: "foot-label" }, it.group_basis),
+    it.target_basis.length
+      ? h("ul", { class: "mig-basis-list" }, ...it.target_basis.map(b => h("li", {}, b)))
+      : null);
+
+  return h("div", { class: `align-card mig-card ${it.status}` },
+    h("div", { class: "card-head" },
+      h("span", { class: `mig-badge ${it.status}` },
+        MIG_STATUS_LABEL[it.status] || it.status),
+      h("span", { class: "cite-mention" }, it.ref_type_label),
+      h("span", { class: "cite-type" }, `组内第 ${it.occurrence} 处`),
+      it.is_manual ? h("span", { class: "manual-tag" }, "人工调整") : null,
+      h("span", { class: "spacer" }),
+      h("span", { class: "cite-type" },
+        `映射 #${it.alignment_id}：旧第 ${it.group_old_indices.map(i => i + 1).join("、")} 段 ↔ 新第 ${it.group_new_indices.map(i => i + 1).join("、")} 段`)),
+    h("div", { class: "card-body" },
+      h("div", { class: "side-by-side" },
+        migSourceBox("old", it.old_mention),
+        migSourceBox("new", it.new_mention)),
+      expectedBlock,
+      basisBlock,
+      h("div", { class: `mig-reason ${it.status}` }, h("b", {}, "判定："), it.reason)));
 }
 
 function applyListFilter() {
